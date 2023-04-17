@@ -1,0 +1,16 @@
+[package]
+name = "diskallocator"
+version = "0.1.0"
+edition = "2021"
+authors = ["Julian Büttner <git@julianbuettner.dev>"]
+license = "MIT"
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "diskallocator"
+crate-type = ["lib"]
+
+[dependencies]
+libc = "0.2.141"
