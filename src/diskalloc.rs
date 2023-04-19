@@ -1,11 +1,13 @@
 use std::{
     alloc::{Allocator, Layout},
     cell::RefCell,
-    fs::{File, OpenOptions},
+    fs::File,
     os::fd::AsRawFd,
     ptr::NonNull,
     sync::{Arc, Mutex},
 };
+
+const STORAGE: u64 = 512 * 1024 * 1024 * 1024;
 
 // Keep file and pointer to memorymap.
 // Memory map can only be created once without changing
@@ -21,24 +23,62 @@ fn calc_byte_skip_for_alignment(first_free_addr: usize, alignment: usize) -> usi
     (alignment - first_free_addr % alignment) % alignment
 }
 
-pub struct DiskAllocator {
+/// Manages the allocation of ideally one vector.  
+/// Sits on top of a file, and resizes it as needed
+/// by the vector.
+///
+/// Usage with vector:
+/// ```rust
+/// #![feature(allocator_api)]
+/// let alloc = Alloc::new().unwrap();
+/// let data = Vec<u64, DiskAlloc> = Vec::new_in(alloc);
+/// ```
+#[derive(Clone)]
+pub struct DiskAlloc {
     alloc: Arc<Mutex<AtomDiskAlloc>>,
+}
+
+impl Drop for AtomDiskAlloc {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.mmap.cast::<libc::c_void>(), STORAGE as libc::size_t);
+        }
+    }
 }
 
 impl AtomDiskAlloc {
     pub fn new() -> Result<Self, std::io::Error> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open("lols.file")?;
-        let terabyte: u64 = (1024 as u64).pow(4);
+        let file = tempfile::tempfile_in("/var/tmp/")?;
+        Self::on_file(file)
+    }
+
+    pub fn remap(&self) -> Result<(), std::io::Error> {
+        let new_addr = unsafe {
+            libc::mmap(
+                self.mmap.cast::<libc::c_void>(),
+                STORAGE as libc::size_t,
+                libc::PROT_WRITE,
+                libc::MAP_SHARED_VALIDATE,
+                self.file.as_raw_fd(),
+                0,
+            )
+        };
+        if new_addr == libc::MAP_FAILED {
+            // Turns out, the OS fails a lot (Err 22, OutOfMemory),
+            // but it works anyways.
+            // println!("Remap failed! {:?}", std::io::Error::last_os_error());
+            // return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn on_file(file: File) -> Result<Self, std::io::Error> {
         let addr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                terabyte as libc::size_t,
+                STORAGE as libc::size_t,
                 libc::PROT_WRITE,
-                libc::MAP_SHARED,
+                libc::MAP_SHARED_VALIDATE,
                 file.as_raw_fd(),
                 0,
             )
@@ -48,14 +88,16 @@ impl AtomDiskAlloc {
         }
         Ok(Self {
             file,
-            mmap: addr as *mut u8,
+            mmap: addr.cast::<u8>(),
             size: 0.into(),
         })
     }
 
     fn resize(&self, size: u64) -> Result<(), std::io::Error> {
         *self.size.borrow_mut() = size;
-        self.file.set_len(size)
+        self.file.set_len(size)?;
+        self.remap()?;
+        Ok(())
     }
 
     fn get_size(&self) -> u64 {
@@ -64,7 +106,7 @@ impl AtomDiskAlloc {
 
     unsafe fn layout_is_end_of_file(&self, ptr: NonNull<u8>, layout: &Layout) -> bool {
         let file_end = self.mmap.offset(self.get_size() as isize);
-        let interval_end = ptr.as_ptr().offset(layout.size() as isize);
+        let interval_end = ptr.as_ptr().add(layout.size());
         file_end == interval_end
     }
 }
@@ -74,7 +116,7 @@ unsafe impl Allocator for AtomDiskAlloc {
         &self,
         layout: std::alloc::Layout,
     ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
-        println!("Alloc: {:?}", layout);
+        println!("Alloc: {layout:?}");
         let interval_start = self.get_size()
             + calc_byte_skip_for_alignment(self.get_size() as usize, layout.align()) as u64;
         let interval_end = interval_start + layout.size() as u64;
@@ -94,7 +136,7 @@ unsafe impl Allocator for AtomDiskAlloc {
 
     fn allocate_zeroed(
         &self,
-        layout: std::alloc::Layout,
+        _layout: std::alloc::Layout,
     ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
         todo!()
     }
@@ -125,7 +167,14 @@ unsafe impl Allocator for AtomDiskAlloc {
         old_layout: std::alloc::Layout,
         new_layout: std::alloc::Layout,
     ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
-        todo!()
+        let fat_ptr = std::slice::from_raw_parts_mut(ptr.as_ptr(), new_layout.size());
+        let success_result = Ok(NonNull::new(fat_ptr).unwrap());
+        if !self.layout_is_end_of_file(ptr, &old_layout) {
+            return success_result;
+        }
+        let shrinkage = old_layout.size() - new_layout.size();
+        self.resize(self.get_size() - shrinkage as u64).unwrap();
+        success_result
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: std::alloc::Layout) {
@@ -138,23 +187,44 @@ unsafe impl Allocator for AtomDiskAlloc {
 
     unsafe fn grow_zeroed(
         &self,
-        ptr: NonNull<u8>,
-        old_layout: std::alloc::Layout,
-        new_layout: std::alloc::Layout,
+        _ptr: NonNull<u8>,
+        _old_layout: std::alloc::Layout,
+        _new_layout: std::alloc::Layout,
     ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
         todo!()
     }
 }
 
-impl DiskAllocator {
+impl DiskAlloc {
+    /// Create a new temporary file in `/var/tmp/`
+    /// and wait for potential "memory" allocation.
+    ///
+    /// Might fail, if file can not be created
+    /// or memory map fails.  
+    /// An OutOfMemory error indicates, that
+    /// no big enough address space could be found
+    /// for the memory map (512GiB).
     pub fn new() -> Result<Self, std::io::Error> {
         Ok(Self {
             alloc: Arc::new(Mutex::new(AtomDiskAlloc::new()?)),
         })
     }
+
+    /// Use custom file (must be read/write)
+    /// to allocate "memory".
+    ///
+    /// Can be useful for debugging.
+    ///
+    /// Do not use same file twice or you will get
+    /// memory access, bus or other unrecoverable hardware errors.
+    pub fn on_file(file: File) -> Result<Self, std::io::Error> {
+        Ok(Self {
+            alloc: Arc::new(Mutex::new(AtomDiskAlloc::on_file(file)?)),
+        })
+    }
 }
 
-unsafe impl Allocator for DiskAllocator {
+unsafe impl Allocator for DiskAlloc {
     fn allocate(
         &self,
         layout: std::alloc::Layout,
@@ -210,6 +280,43 @@ unsafe impl Allocator for DiskAllocator {
     where
         Self: Sized,
     {
-        &self
+        self
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn alloc_grow_shrink() {
+        let allocator = AtomDiskAlloc::new().unwrap();
+        assert_eq!(*allocator.size.borrow(), 0);
+        let _alloc1 = allocator
+            .allocate(Layout::from_size_align(64, 8).unwrap())
+            .unwrap();
+        assert_eq!(*allocator.size.borrow(), 64);
+        let _alloc2 = allocator
+            .allocate(Layout::from_size_align(64_000, 16).unwrap())
+            .unwrap();
+        assert_eq!(*allocator.size.borrow(), 64_064);
+        let _alloc2a = unsafe {
+            allocator
+                .shrink(
+                    NonNull::new(_alloc2.as_ptr().cast::<u8>()).unwrap(),
+                    Layout::from_size_align(64_000, 16).unwrap(),
+                    Layout::from_size_align(64, 16).unwrap(),
+                )
+                .unwrap()
+        };
+        assert_eq!(*allocator.size.borrow(), 128);
+        let _alloc2b = unsafe {
+            allocator.grow(
+                NonNull::new(_alloc2a.as_ptr().cast::<u8>()).unwrap(),
+                Layout::from_size_align(64, 16).unwrap(),
+                Layout::from_size_align(128_000, 16).unwrap(),
+            )
+        };
+        assert_eq!(*allocator.size.borrow(), 128_064);
     }
 }
