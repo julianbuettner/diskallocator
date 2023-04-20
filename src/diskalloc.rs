@@ -30,8 +30,8 @@ fn calc_byte_skip_for_alignment(first_free_addr: usize, alignment: usize) -> usi
 /// Usage with vector:
 /// ```rust
 /// #![feature(allocator_api)]
-/// let alloc = Alloc::new().unwrap();
-/// let data = Vec<u64, DiskAlloc> = Vec::new_in(alloc);
+/// let alloc = diskallocator::DiskAlloc::new().unwrap();
+/// let data: Vec<u64, diskallocator::DiskAlloc> = Vec::new_in(alloc);
 /// ```
 #[derive(Clone)]
 pub struct DiskAlloc {
@@ -50,26 +50,6 @@ impl AtomDiskAlloc {
     pub fn new() -> Result<Self, std::io::Error> {
         let file = tempfile::tempfile_in("/var/tmp/")?;
         Self::on_file(file)
-    }
-
-    pub fn remap(&self) -> Result<(), std::io::Error> {
-        let new_addr = unsafe {
-            libc::mmap(
-                self.mmap.cast::<libc::c_void>(),
-                STORAGE as libc::size_t,
-                libc::PROT_WRITE,
-                libc::MAP_SHARED_VALIDATE,
-                self.file.as_raw_fd(),
-                0,
-            )
-        };
-        if new_addr == libc::MAP_FAILED {
-            // Turns out, the OS fails a lot (Err 22, OutOfMemory),
-            // but it works anyways.
-            // println!("Remap failed! {:?}", std::io::Error::last_os_error());
-            // return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
     }
 
     pub fn on_file(file: File) -> Result<Self, std::io::Error> {
@@ -96,7 +76,6 @@ impl AtomDiskAlloc {
     fn resize(&self, size: u64) -> Result<(), std::io::Error> {
         *self.size.borrow_mut() = size;
         self.file.set_len(size)?;
-        self.remap()?;
         Ok(())
     }
 
@@ -116,7 +95,6 @@ unsafe impl Allocator for AtomDiskAlloc {
         &self,
         layout: std::alloc::Layout,
     ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
-        println!("Alloc: {layout:?}");
         let interval_start = self.get_size()
             + calc_byte_skip_for_alignment(self.get_size() as usize, layout.align()) as u64;
         let interval_end = interval_start + layout.size() as u64;

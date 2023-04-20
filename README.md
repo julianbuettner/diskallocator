@@ -111,6 +111,6 @@ fn main() {
         v.push(Dummy::new());
     }
     println!("Check file dummy.file!");
-    thread::sleep(Duration::from_secs(999999));
+    // thread::sleep(Duration::from_secs(999999));
 }
 ```
