@@ -53,12 +53,24 @@ impl AtomDiskAlloc {
     }
 
     pub fn on_file(file: File) -> Result<Self, std::io::Error> {
+        #[cfg(target_os = "linux")]
         let addr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 STORAGE as libc::size_t,
-                libc::PROT_WRITE,
+                libc::PROT_WRITE | libc::PROT_READ,
                 libc::MAP_SHARED_VALIDATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                STORAGE as libc::size_t,
+                libc::PROT_WRITE | libc::PROT_READ,
+                libc::MAP_SHARED,
                 file.as_raw_fd(),
                 0,
             )

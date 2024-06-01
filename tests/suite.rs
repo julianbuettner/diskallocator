@@ -1,6 +1,5 @@
 #![feature(allocator_api)]
 
-
 use diskallocator::{self, DiskAlloc};
 use rand::Rng;
 
@@ -85,4 +84,24 @@ fn multi_allocs() {
         .map(|_| DiskAlloc::new().unwrap())
         .collect::<Vec<DiskAlloc>>();
     assert_eq!(allocator_collection.len(), count);
+}
+
+#[test]
+fn large_memory_vec() {
+    // creates a vector that will take 60g of RAM.
+    let mut v = Vec::with_capacity_in(60_000_000_000, DiskAlloc::new().unwrap());
+    for byte in 0_i64..60_000_000_000 {
+        if byte % 1_000_000_000 == 0 {
+            println!("{byte}");
+        }
+
+        v.push(byte);
+    }
+    for byte in 0_i64..60_000_000_000 {
+        if byte % 1_000_000_000 == 0 {
+            println!("{byte}");
+        }
+
+        assert_eq!(v[byte as usize], byte);
+    }
 }
